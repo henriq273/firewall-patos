@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>       // malloc, free
+#include <time.h>         // time, localtime, strftime
 #include <fcntl.h>         // open
 #include <unistd.h>        // close, read, write
 #include <sys/ioctl.h>     // ioctl
@@ -29,6 +31,13 @@ struct packet_info {
     uint32_t src_ip, dst_ip;
     uint8_t protocol;
     unsigned short is_fragment;
+
+    uint16_t frag_offset;         // offset do fragmento, 0 quando não se aplica
+    uint16_t total_length;          // tamanho total do pacote, 0 quando não se aplica
+    uint16_t frag_id;              // identificador do fragmento, 0 quando não se aplica
+
+    uint16_t ip_checksum;          // checksum do cabeçalho IP, 0 quando não se aplica
+    uint16_t transport_checksum;     // checksum do cabeçalho de transporte, 0 quando não se aplica
 
     uint16_t src_port, dst_port;   // 0 quando não se aplica (ICMP)
     uint8_t tcp_flags;             // bitmask normalizado
@@ -98,7 +107,15 @@ parse_status_t parse_packet(const uint8_t *packet, size_t packet_len, struct pac
     pkt_info->src_ip = ip_header->saddr;
     pkt_info->dst_ip = ip_header->daddr;
     pkt_info->protocol = ip_header->protocol;
+
     pkt_info->is_fragment = (ntohs(ip_header->frag_off) & IP_MF) || (ntohs(ip_header->frag_off) & IP_OFFMASK);
+    pkt_info->frag_id = ntohs(ip_header->id);
+    pkt_info->ip_checksum = ntohs(ip_header->check);
+    pkt_info->total_length = ntohs(ip_header->tot_len);
+    pkt_info->frag_offset = ntohs(ip_header->frag_off);
+
+    pkt_info->raw = packet;
+    pkt_info->raw_len = packet_len;
 
     if (pkt_info->is_fragment) {
         return PARSE_FRAGMENT;
@@ -121,6 +138,15 @@ parse_status_t parse_packet(const uint8_t *packet, size_t packet_len, struct pac
             pkt_info->ack = ntohl(tcp_header->ack_seq);
             pkt_info->payload = payload + tcp_header->doff * 4;
             pkt_info->payload_len = payload_len - tcp_header->doff * 4;
+            pkt_info->transport_checksum = ntohs(tcp_header->check);
+
+            uint8_t flags = 0;
+            flags |= tcp_header->fin << 0;
+            flags |= tcp_header->syn << 1;
+            flags |= tcp_header->rst << 2;
+            flags |= tcp_header->psh << 3;
+            flags |= tcp_header->ack << 4;
+            flags |= tcp_header->urg << 5;
             break;
         }
 
@@ -133,6 +159,7 @@ parse_status_t parse_packet(const uint8_t *packet, size_t packet_len, struct pac
             pkt_info->dst_port = ntohs(udp_header->dest);
             pkt_info->payload = payload + sizeof(struct udphdr);
             pkt_info->payload_len = payload_len - sizeof(struct udphdr);
+            pkt_info->transport_checksum = ntohs(udp_header->check);
             break;
         }
 
@@ -145,6 +172,7 @@ parse_status_t parse_packet(const uint8_t *packet, size_t packet_len, struct pac
             pkt_info->icmp_code = icmp_header->code;
             pkt_info->payload = payload + sizeof(struct icmphdr);
             pkt_info->payload_len = payload_len - sizeof(struct icmphdr);
+            pkt_info->transport_checksum = ntohs(icmp_header->checksum);
             break;
         }
 
@@ -153,6 +181,55 @@ parse_status_t parse_packet(const uint8_t *packet, size_t packet_len, struct pac
     }
 
     return PARSE_OK;
+}
+
+char* get_parse_status_message(parse_status_t status) {
+    switch (status) {
+        case PARSE_OK:
+            return "parse_success";
+        case PARSE_TOO_SHORT:
+            return "parse_too_short";
+        case PARSE_BAD_VERSION:
+            return "parse_bad_version";
+        case PARSE_BAD_IHL:
+            return "parse_bad_ipheader_length";
+        case PARSE_FRAGMENT:
+            return "parse_fragment";
+        case PARSE_UNSUPPORTED_PROTOCOL:
+            return "parse_unsupported_protocol";
+        default:
+            return "parse_unknown";
+    }
+}
+
+char* get_proto_str (uint8_t protocol) {
+    switch (protocol) {
+        case IPPROTO_TCP:
+            return "TCP";
+        case IPPROTO_UDP:
+            return "UDP";
+        case IPPROTO_ICMP:
+            return "ICMP";
+        default:
+            return "OTHER";
+    }
+}
+
+void log_event (FILE* log_file, const char* event, const char* level, struct packet_info* pkt_info) {
+    time_t now = time(NULL);
+    char time_str[32];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    char* proto_str = get_proto_str(pkt_info->protocol);
+
+    fprintf(log_file, "%s level=%s ", time_str, level);
+
+    fprintf(log_file, "proto=%s src=%s sport=%u dst=%s dport=%u\n", proto_str,
+            inet_ntoa(*(struct in_addr*)&pkt_info->src_ip), pkt_info->src_port,
+            inet_ntoa(*(struct in_addr*)&pkt_info->dst_ip), pkt_info->dst_port);
+    
+    fprintf(log_file, "reason=%s\n", event);
+
+    fflush(log_file);
 }
 
 int main(void) {
@@ -164,14 +241,16 @@ int main(void) {
         return 1;
     }
 
-    FILE *log_file = fopen("firewall.log", "a");
+    FILE* log_file = fopen("firewall.log", "a");
     if (!log_file) {
         perror("fopen");
         close(tun_fd);
         return 1;
     }
+    // define o buffer do log para linha por linha
+    setvbuf(log_file, NULL, _IOLBF, 0);
 
-    FILE *blocklist_file = fopen("blocklist.txt", "r");
+    FILE* blocklist_file = fopen("blocklist.txt", "r");
     if (!blocklist_file) {
         perror("fopen");
         fclose(log_file);
@@ -190,9 +269,12 @@ int main(void) {
         struct packet_info pkt_info;
         parse_status_t status = parse_packet(buffer, nread, &pkt_info);
         if (status != PARSE_OK) {
-            fprintf(stderr, "Erro ao analisar o pacote: %d\n", status);
+            log_event(log_file, get_parse_status_message(status), "ERROR", &pkt_info);
             continue;
         }
+
+        // verifica se o pacote deve ser bloqueado
+        int blocked = 0;
 
     }
 
